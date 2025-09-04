@@ -100,64 +100,22 @@ def fit_ellipse_direct(pts: np.ndarray):
     return (cx, cy, rx, ry, float(theta % math.pi)), float(err)
 
 # ==== preprocesado y ejecución de potrace ======================================
-def binarize_and_close(img_path: str, outdir: str, close_px: int = 2) -> str:
+# new import for autotrace
+from autotrace import Bitmap
+
+def binarize_and_close(img_path: str, outdir: str, close_px: int = 2) -> np.ndarray:
+    """Preprocesses the image and returns a binary numpy array."""
     os.makedirs(outdir, exist_ok=True)
     gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     assert gray is not None, f"No se pudo leer {img_path}"
     # umbral adaptativo estable para dibujos lineales en blanco/negro
-    thr1 = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+    thr1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                  cv2.THRESH_BINARY_INV, 31, 5)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(close_px*2+1, close_px*2+1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1))
     closed = cv2.morphologyEx(thr1, cv2.MORPH_CLOSE, kernel, iterations=1)
-    # PBM para potrace
-    pbm_path = os.path.join(outdir, "prep.pbm")
-    Image.fromarray((closed>0).astype(np.uint8)*255).convert("1").save(pbm_path)
-    cv2.imwrite(os.path.join(outdir,"debug_bin.png"), closed)
-    return pbm_path
-
-def have_potrace_cli() -> bool:
-    return shutil.which("potrace") is not None
-
-def run_potrace_cli(pbm_path: str, out_svg: str,
-                    turdsize=0, alphamax=1.0, opttolerance=0.2, longcurve=True):
-    args = [
-        "potrace", pbm_path, "--svg", "-o", out_svg,
-        "--turdsize", str(turdsize),
-        "--alphamax", str(alphamax),
-        "--opttolerance", str(opttolerance),
-        "--unit", "1",
-    ]
-    if longcurve: args.append("--longcurve")
-    subprocess.check_call(args)
-
-def run_potrace_fallback(pbm_path: str, out_svg: str):
-    """Fallback pure-python (tatarize/potrace)."""
-    import potrace as pypotr
-    bmp = Image.open(pbm_path).convert("1")
-    bmp = np.array(bmp).astype(np.uint8)
-    bmp = (bmp > 0).astype(np.uint8)
-    bmp = np.ascontiguousarray(bmp)
-    bmpobj = pypotr.Bitmap(bmp)
-    path = bmpobj.trace()
-    # export SVG simple
-    parts = []
-    scale = 1.0
-    for curve in path:
-        pt = curve.start_point
-        d = f"M {pt.x*scale} {pt.y*scale} "
-        for segment in curve:
-            if segment.is_corner:
-                c = segment.c
-                d += f"L {c.x*scale} {c.y*scale} "
-            else:
-                a,b,c = segment.c1, segment.c2, segment.end_point
-                d += f"C {a.x*scale} {a.y*scale} {b.x*scale} {b.y*scale} {c.x*scale} {c.y*scale} "
-        d += "Z"
-        parts.append(d)
-    svg = '<svg xmlns="http://www.w3.org/2000/svg">\n' + \
-          "".join(f'<path d="{d}" fill="none" stroke="black" stroke-width="1"/>\n' for d in parts) + \
-          '</svg>'
-    with open(out_svg,"w",encoding="utf-8") as f: f.write(svg)
+    cv2.imwrite(os.path.join(outdir, "debug_bin.png"), closed)
+    # Convert grayscale to RGB for autotrace library
+    return cv2.cvtColor(closed, cv2.COLOR_GRAY2RGB)
 
 # ==== muestreo de paths SVG y clasificación geométrica =========================
 def sample_svg(svg_path: str, step: float = 2.0) -> List[np.ndarray]:
@@ -202,7 +160,7 @@ def split_poly_by_curvature(pts: np.ndarray, win=5, k_thresh=0.01) -> List[np.nd
     chunks = [pts[s:e+1] for s,e in zip(splits[:-1], splits[1:])]
     return chunks
 
-def classify_chunk(pts: np.ndarray, line_eps=0.8, circle_rms=0.8):
+def classify_chunk(pts: np.ndarray, line_eps=0.8, circle_rms=2.0, ellipse_err=0.2):
     """Devuelve ('line', LineSeg) | ('arc', ArcSeg) | ('ellipse', Ellipse) | None."""
     if len(pts) < 2: return None
     # 1) ¿línea?
@@ -221,7 +179,7 @@ def classify_chunk(pts: np.ndarray, line_eps=0.8, circle_rms=0.8):
         return ("arc", ArcSeg(float(c[0]), float(c[1]), float(r), a0, a1))
     # 3) ¿elipse?
     ell, e_err = fit_ellipse_direct(pts)
-    if ell and e_err < 0.08:
+    if ell and e_err < ellipse_err:
         cx,cy,rx,ry,rot = ell
         if rx>3 and ry>2:
             # círculo especial
@@ -273,23 +231,25 @@ def snap_endpoints(lines: List[LineSeg], tol=2.0) -> List[LineSeg]:
     return out
 
 # ==== pipeline =================================================================
-def vectorize_with_potrace(input_image: str, outdir: str,
-                           step=2.0, rdp_eps=0.8,
-                           circle_rms=0.8, line_eps=0.8,
-                           close_px=2):
+def vectorize_image(input_image: str, outdir: str,
+                    step=2.0, rdp_eps=0.8,
+                    circle_rms=2.0, line_eps=0.8,
+                    ellipse_err=0.2, close_px=2):
+    """Main vectorization pipeline."""
     os.makedirs(outdir, exist_ok=True)
-    pbm_path = binarize_and_close(input_image, outdir, close_px=close_px)
 
-    raw_svg = os.path.join(outdir, "trace_raw.svg")
-    if have_potrace_cli():
-        # Ajusta alphamax/opttolerance para suavidad vs fidelidad
-        run_potrace_cli(pbm_path, raw_svg, turdsize=0, alphamax=1.0, opttolerance=0.2, longcurve=True)
-    else:
-        print("[WARN] potrace CLI no encontrado; usando fallback puro-python (más lento).")
-        run_potrace_fallback(pbm_path, raw_svg)
+    # 1. Preprocess the image to get a binary numpy array
+    binary_array = binarize_and_close(input_image, outdir, close_px=close_px)
 
-    # muestreo de paths trazados
-    polys = sample_svg(raw_svg, step=step)
+    # 2. Vectorize using pyautotrace
+    raw_svg_path = os.path.join(outdir, "trace_raw.svg")
+    print("[INFO] Tracing with pyautotrace...")
+    bitmap = Bitmap(binary_array)
+    vector = bitmap.trace()
+    vector.save(raw_svg_path)
+
+    # 3. Sample points from the raw SVG paths
+    polys = sample_svg(raw_svg_path, step=step)
     # visualización de puntos
     debug_points = np.ones((1024, 1024, 3), dtype=np.uint8)*255
     for poly in polys:
@@ -309,7 +269,7 @@ def vectorize_with_potrace(input_image: str, outdir: str,
             # simplifica cada trozo y clasifícalo
             keep = rdp(ch, rdp_eps)
             ch2 = ch[keep]
-            cls = classify_chunk(ch2, line_eps=line_eps, circle_rms=circle_rms)
+            cls = classify_chunk(ch2, line_eps=line_eps, circle_rms=circle_rms, ellipse_err=ellipse_err)
             if cls is None: 
                 # si no clasifica, intenta línea por mínimos cuadrados
                 (vx,vy,x0,y0) = cv2.fitLine(ch2.astype(np.float32), cv2.DIST_L2,0,0.01,0.01)
@@ -385,13 +345,14 @@ def main():
     ap.add_argument("--outdir", default="potrace_out", help="carpeta de salida")
     ap.add_argument("--step", type=float, default=2.0, help="paso de muestreo sobre paths de potrace (px)")
     ap.add_argument("--rdp", type=float, default=0.8, help="epsilon RDP por trozo")
-    ap.add_argument("--circle_rms", type=float, default=0.8, help="umbral RMS para círculo")
+    ap.add_argument("--circle_rms", type=float, default=2.0, help="umbral RMS para círculo")
+    ap.add_argument("--ellipse_err", type=float, default=0.2, help="umbral de error para elipse")
     ap.add_argument("--line_eps", type=float, default=0.8, help="epsilon línea (RDP)")
     ap.add_argument("--close_px", type=int, default=2, help="radio del cierre morfológico previo")
     args = ap.parse_args()
-    vectorize_with_potrace(args.inp, args.outdir, step=args.step, rdp_eps=args.rdp,
-                           circle_rms=args.circle_rms, line_eps=args.line_eps,
-                           close_px=args.close_px)
+    vectorize_image(args.inp, args.outdir, step=args.step, rdp_eps=args.rdp,
+                    circle_rms=args.circle_rms, line_eps=args.line_eps,
+                    ellipse_err=args.ellipse_err, close_px=args.close_px)
 
 if __name__ == "__main__":
     main()
